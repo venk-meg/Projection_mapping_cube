@@ -7,3 +7,8 @@
 - orientation extraction
 - compose image
 - project image back
+
+
+## Useful Links
+
+https://docs.opencv.org/4.x/d9/dab/tutorial_homography.html
