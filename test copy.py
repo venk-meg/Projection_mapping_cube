@@ -35,7 +35,7 @@ PROJ_Y_OFFSET = 0
 # Edge / Hough parameters (tweak as needed)
 CANNY_LOW, CANNY_HIGH  = 40, 50
 HOUGH_THRESH           = 10
-HOUGH_MIN_LEN, HOUGH_GAP = 5, 10
+HOUGH_MIN_LEN, HOUGH_GAP = 15, 5
 # ------------------------------------------------------------------
 
 def get_frame() -> np.ndarray:
@@ -235,11 +235,13 @@ def create_quads(lines):
             unique_points.add((x1, y1))
             unique_points.add((x2, y2))
         if len(unique_points) == 4:
-            quads += [test_quad]
+            # quads += [point for point in unique_points]
+            quads.append(list(unique_points))
+            # quads = [[(211, 112), ( 102, 345), (543, 765), (143, 423)]]
     return quads
 
 
-def compute_homography_from_image(square_img, quad_lines):
+def compute_homography_from_image(square_img, quad_points):
     """
     Computes a 3×3 homography mapping the corners of ⁠ square_img ⁠ onto ⁠ quad_points ⁠.
 
@@ -252,36 +254,42 @@ def compute_homography_from_image(square_img, quad_lines):
         H : 3×3 homography matrix
     """
     # print(f"quadlines{quad_lines}")
+    '''
     quad_points = []
     for line in quad_lines:
+        if 
         x1, y1, x2, y2 = line
         quad_points += [[x1, y1]]
     
     # print(f"quadpoints{quad_points}")
+    '''
+
+    # print(quad_points)
         
     quad_points = order_points_clockwise(quad_points)
+    # print(quad_points)
         
     h, w = square_img.shape[:2]
 
     # define the four corners of the source image in pixel coords
-    # src_pts = np.array([
-    #     [0,   0   ],   # top‑left
-    #     [w-1, 0   ],   # top‑right
-    #     [w-1, h-1 ],   # bottom‑right
-    #     [0,   h-1 ]    # bottom‑left
-    # ], dtype=np.float32)
-
     src_pts = np.array([
-        [w-1, 0   ],   # top‑right
         [0,   0   ],   # top‑left
-        [0,   h-1 ],   # bottom‑left
-        [w-1, h-1 ]    # bottom‑right
+        [w-1, 0   ],   # top‑right
+        [w-1, h-1 ],   # bottom‑right
+        [0,   h-1 ]    # bottom‑left
     ], dtype=np.float32)
+
+    # src_pts = np.array([
+    #     [w-1, 0   ],   # top‑right
+    #     [0,   0   ],   # top‑left
+    #     [0,   h-1 ],   # bottom‑left
+    #     [w-1, h-1 ]    # bottom‑right
+    # ], dtype=np.float32)
 
     # make sure your quad_points are also in the same (clockwise) order:
     dst_pts = np.array(quad_points, dtype=np.float32)
-    print(f"sourcepts{src_pts}")
-    print(f"distpts{dst_pts}")
+    # print(f"sourcepts{src_pts}")
+    # print(f"distpts{dst_pts}")
 
     # compute the homography
     H = cv.getPerspectiveTransform(src_pts, dst_pts)
@@ -293,11 +301,31 @@ def apply_homography(H, workspace, square_img):
     The non-transformed background remains black.
     """
     ws_width, ws_height = workspace
-    warped = np.zeros((ws_height, ws_width, 3), dtype=np.uint8)
-    transformed = cv.warpPerspective(square_img, H, (ws_width, ws_height),
+    
+    if square_img.shape[2] == 4:
+        square_rgb = square_img[:, :, :3]
+        square_alpha = square_img[:, :, 3]  # extract alpha channel
+    else:
+        square_rgb = square_img
+        square_alpha = np.ones(square_img.shape[:2], dtype=np.uint8) * 255
+
+    # warped = np.zeros((ws_height, ws_width, 3), dtype=np.uint8)
+    
+    warped_rgb = cv.warpPerspective(square_rgb, H, (ws_width, ws_height),
+                                    borderMode=cv.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    warped_alpha = cv.warpPerspective(square_alpha, H, (ws_width, ws_height),
                                        borderMode=cv.BORDER_CONSTANT, borderValue=(0, 0, 0))
-    mask = cv.cvtColor(transformed, cv.COLOR_BGR2GRAY) > 0
-    warped[mask] = transformed[mask]
+
+    warped = np.zeros((ws_height, ws_width, 3), dtype=np.uint8)
+    mask = warped_alpha > 0
+
+    for c in range(3):
+        warped[:, :, c][mask] = warped_rgb[:, :, c][mask]
+    
+    # transformed = cv.warpPerspective(square_img, H, (ws_width, ws_height),
+    #                                    borderMode=cv.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    # mask = cv.cvtColor(transformed, cv.COLOR_BGR2GRAY) > 0
+    # warped[mask] = transformed[mask]
     return warped
 
 def combine_images(image_list):
@@ -382,12 +410,12 @@ def main() -> None:
     # cv.namedWindow("Lines",  cv.WINDOW_NORMAL)
     # cv.resizeWindow("Lines", 640, 360)
 
-    # cv.namedWindow("Projector", cv.WINDOW_NORMAL)
-    # cv.moveWindow("Projector", PROJ_X_OFFSET, PROJ_Y_OFFSET)
-    # cv.resizeWindow("Projector", *PROJ_RES)
-    # cv.setWindowProperty("Projector",
-    #                      cv.WND_PROP_FULLSCREEN,
-    #                      cv.WINDOW_FULLSCREEN)
+    cv.namedWindow("Projector", cv.WINDOW_NORMAL)
+    cv.moveWindow("Projector", PROJ_X_OFFSET, PROJ_Y_OFFSET)
+    cv.resizeWindow("Projector", *PROJ_RES)
+    cv.setWindowProperty("Projector",
+                         cv.WND_PROP_FULLSCREEN,
+                         cv.WINDOW_FULLSCREEN)
 
     # 3. main loop
     while True:
@@ -403,12 +431,14 @@ def main() -> None:
 
         quads = create_quads(lines_final)
 
+        print(f"len_quads: {len(quads)}")
+
         image_list = []
         for i, q in enumerate(quads):
-            print(i)
+            # print(i)
             if i > 2:
                 break
-            image = cv.imread(f"square{i+1}.jpg")
+            image = cv.imread(f"square{i+1}.png", cv.IMREAD_UNCHANGED)
             image_list.append(image)
 
         H_list = []
@@ -416,19 +446,19 @@ def main() -> None:
             # print(image_list[i])
             H = compute_homography_from_image(image_list[i], quads[i]).astype(np.float32)
             H_list.append(H)
-            print(f'H_list{i}: {H}')
+            # print(f'H_list{i}: {H}')
 
         warped_list = []
         for i, H in enumerate(H_list):
             warped = apply_homography(H, frame.shape[1::-1], image_list[i])
             warped_list.append(warped)
 
-        # montage = combine_images(warped_list)
-        # if montage is None:
-        #     continue
+        montage = combine_images(warped_list)
+        if montage is None:
+            continue
         
         # print(f"quads {quads}")
-        # canvas1 = np.zeros_like(frame)
+        canvas = np.zeros_like(frame)
 
         # for i, q in enumerate(quads):
         #     color = (0,255,255)
@@ -440,17 +470,28 @@ def main() -> None:
         #         cv.line(canvas1, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])),
         #                 color=color, thickness=1)
 
-        proj = warp_to_projector(warped_list[0], H_cp)
+        proj = warp_to_projector(montage, H_cp)
 
+
+        #_______PROJ FGURING OUT
+
+        brightness_factor = 0.5  # or 0.1, adjust as needed
+        proj = np.clip(proj * brightness_factor, 0, 255).astype(np.uint8)
+
+        
+        # print(proj)
         # previews
         # cv.imshow("Camera", frame)
-        # cv.imshow("Edges",  edges)
-        # cv.imshow("Lines",  canvas)
+        cv.imshow("Edges",  proj)
+        cv.imshow("Lines",  line_img)
         # cv.imshow("Points",  canvas1)
         # cv.imshow("Lines",  line_img)
         # projector output
-        cv.imshow("Edges", proj)
-        # cv.imshow("Projector", proj)
+        # cv.imshow("Edges", proj)
+        if len(quads) < 7:
+            cv.imshow("Projector", proj)
+        else:
+            cv.imshow("Projector", canvas)
 
         if cv.waitKey(1) & 0xFF in (27, ord('q')):
             break
