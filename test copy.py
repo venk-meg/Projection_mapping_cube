@@ -18,7 +18,9 @@ import platform, sys
 import cv2 as cv
 import numpy as np
 from itertools import combinations
-
+import shapely
+import shapely.ops
+from sklearn.cluster import DBSCAN
 
 # ----------------------------- CONFIG -----------------------------
 USE_STATIC_IMAGE   = False
@@ -102,47 +104,93 @@ def filter_parallel_close(lines, angle_thresh_deg: float = 10.0):
                 keep[short_idx] = False
     return L[keep]
 
-def cluster_endpoints(lines: np.ndarray, fraction: float = 0.25) -> list[tuple[float, float]]:
+
+def cluster_endpoints(lines: np.ndarray,
+                      fraction: float = 0.25) -> list[tuple[float, float]]:
 
     L = np.asarray(lines, dtype=np.float64).reshape(-1, 4)
     if L.shape[1] != 4:
         raise ValueError("lines must be (N,4)")
 
+    dist_arr = [    np.linalg.norm((x2 - x1, y2 - y1))    for x1, y1, x2, y2 in L]
+    med_dist = np.median(dist_arr)
+
+    eps_val = 0.33
+
     # 1. collect endpoints
     p1 = L[:, 0:2]
     p2 = L[:, 2:4]
-    pts = np.vstack((p1, p2))               # (2N,2)
+    pts = np.vstack((p1, p2))  # (2N,2)
+    # print(pts)
+    clusters = DBSCAN(eps=eps_val * med_dist, min_samples=1).fit(pts)
+    x_sums = []
+    y_sums = []
+    counts = []
+    for i in range(len(clusters.labels_)):
+        if clusters.labels_[i] >= len(x_sums):
+            x_sums += [pts[i][0]]
+            y_sums += [pts[i][1]]
+            counts += [1]
+        else:
+            x_sums[clusters.labels_[i]] += pts[i][0]
+            y_sums[clusters.labels_[i]] += pts[i][1]
+            counts[clusters.labels_[i]] += 1
 
-    # 2. distance threshold
-    seg_len = np.hypot(L[:, 2] - L[:, 0], L[:, 3] - L[:, 1])
-    thresh  = fraction * seg_len.max()
+    for i in range(len(x_sums)):
+        x_sums[i] /= counts[i]
+        y_sums[i] /= counts[i]
 
-    # 3. agglomerative clustering (single-link)
-    n = len(pts)
-    clusters: list[list[int]] = []
-    unassigned = list(range(n))
+    for i in range(len(L)):
+        L[i][0] = x_sums[clusters.labels_[i]]
+        L[i][1] = y_sums[clusters.labels_[i]]
+        L[i][2] = x_sums[clusters.labels_[i + len(L)]]
+        L[i][3] = y_sums[clusters.labels_[i + len(L)]]
 
-    while unassigned:
-        seed = unassigned.pop()             # start a new cluster
-        stack = [seed]
-        cluster = [seed]
+    return L
 
-        while stack:
-            idx = stack.pop()
-            # squared Euclidean distance to remaining points
-            d2 = np.sum((pts[unassigned] - pts[idx])**2, axis=1)
-            nearby_mask = d2 < thresh**2
-            nearby_idx  = [unassigned[i] for i, flag in enumerate(nearby_mask) if flag]
-            for k in nearby_idx:
-                unassigned.remove(k)
-                stack.append(k)
-                cluster.append(k)
 
-        clusters.append(cluster)
+def split_lines_at_nearby_points(raw_lines):
 
-    # 4. centroids
-    centroids = [tuple(pts[c].mean(axis=0)) for c in clusters]
-    return centroids
+    L = np.asarray(raw_lines, dtype=np.float64).reshape(-1, 4)
+    if L.shape[1] != 4:
+        raise ValueError("lines must be (N,4)")
+
+    dist_arr = [    np.linalg.norm((x2 - x1, y2 - y1))    for x1, y1, x2, y2 in L]
+    med_dist = np.median(dist_arr)
+    eps_val = 0.33
+
+    threshold = med_dist * eps_val
+
+    # 1. Build LineStrings and collect all endpoints
+    lines = [shapely.LineString([(x1, y1), (x2, y2)]) for x1, y1, x2, y2 in raw_lines]
+    endpoints = [shapely.Point(ls.coords[0]) for ls in lines] + [shapely.Point(ls.coords[-1]) for ls in lines]
+
+    new_segments = []
+    for ls in lines:
+        start_pt = shapely.Point(ls.coords[0])
+        end_pt   = shapely.Point(ls.coords[-1])
+        did_split = False
+
+        for pt in endpoints:
+            # skip its own endpoints
+            if pt.equals(start_pt) or pt.equals(end_pt):
+                continue
+
+            # if 'pt' lies near the interior of 'ls'
+            if ls.distance(pt) <= threshold:
+                # manually form two new lines:
+                #   segment A: start → pt
+                new_segments.append((start_pt.x, start_pt.y, pt.x, pt.y))
+                #   segment B: pt → end
+                new_segments.append((pt.x, pt.y, end_pt.x, end_pt.y))
+                did_split = True
+                break
+
+        # if no split happened, preserve the original line
+        if not did_split:
+            new_segments.append((start_pt.x, start_pt.y, end_pt.x, end_pt.y))
+
+    return new_segments
 
 def order_points_clockwise(pts):
     """
@@ -166,57 +214,34 @@ def is_opposite_edges_parallel(ordered_quad, threshold_deg=10):
         v = ordered_quad[(i+1)%4] - ordered_quad[i]
         norm = np.linalg.norm(v) + 1e-6
         edges.append(v / norm)
-    
+
     # Opposite edges are 0↔2 and 1↔3
     dot02 = abs(np.dot(edges[0], edges[2]))
     dot13 = abs(np.dot(edges[1], edges[3]))
-    
+
     # Convert to deviation angle from perfect parallelism
     ang02 = np.degrees(np.arccos(np.clip(dot02, -1.0, 1.0)))
     ang13 = np.degrees(np.arccos(np.clip(dot13, -1.0, 1.0)))
-    
+
     return (ang02 < threshold_deg) and (ang13 < threshold_deg)
 
-def create_quadrilaterals(points, parallel_threshold=15):
-    valid_quads = []
-    
-    if len(points) < 5:
-        max_candidates = 1
-    elif len(points) > 6:
-        max_candidates = 3
-    else:
-        max_candidates = 2
-
-    # 1) Generate all 4‑point combinations
-    for comb in combinations(points, 4):
-        quad = np.array(comb, dtype=np.float32)
-        ordered_quad = order_points_clockwise(quad)
-        
-        # 2) Convexity check
-        if not cv.isContourConvex(ordered_quad):
-            continue
-        
-        # 3) Parallel‑edge check
-        if not is_opposite_edges_parallel(ordered_quad, threshold_deg=parallel_threshold):
-            continue
-        
-        # 4) Compute area and store
-        area = cv.contourArea(ordered_quad)
-        valid_quads.append((area, ordered_quad))
-    
-    # 5) Sort by area, ascending, and keep only the smallest max_candidates
-    valid_quads.sort(key=lambda x: x[0])
-    selected = valid_quads[:max_candidates]
-    
-    # 6) Extract just the quad arrays
-    quad_list = [quad for (_, quad) in selected]
-    
-    return quad_list, len(quad_list)
+def create_quads(lines):
+    quads = []
+    combos = list(combinations(lines, 4))
+    for test_quad in combos:
+        unique_points = set()
+        for line in test_quad:
+            x1, y1, x2, y2 = line
+            unique_points.add((x1, y1))
+            unique_points.add((x2, y2))
+        if len(unique_points) == 4:
+            quads += [test_quad]
+    return quads
 
 
-def compute_homography_from_image(square_img, quad_points):
+def compute_homography_from_image(square_img, quad_lines):
     """
-    Computes a 3×3 homography mapping the corners of `square_img` onto `quad_points`.
+    Computes a 3×3 homography mapping the corners of ⁠ square_img ⁠ onto ⁠ quad_points ⁠.
 
     Parameters:
         square_img   : numpy.ndarray   your source image (square or rectangle)
@@ -226,23 +251,41 @@ def compute_homography_from_image(square_img, quad_points):
     Returns:
         H : 3×3 homography matrix
     """
+    # print(f"quadlines{quad_lines}")
+    quad_points = []
+    for line in quad_lines:
+        x1, y1, x2, y2 = line
+        quad_points += [[x1, y1]]
+    
+    # print(f"quadpoints{quad_points}")
+        
+    quad_points = order_points_clockwise(quad_points)
+        
     h, w = square_img.shape[:2]
 
     # define the four corners of the source image in pixel coords
+    # src_pts = np.array([
+    #     [0,   0   ],   # top‑left
+    #     [w-1, 0   ],   # top‑right
+    #     [w-1, h-1 ],   # bottom‑right
+    #     [0,   h-1 ]    # bottom‑left
+    # ], dtype=np.float32)
+
     src_pts = np.array([
-        [0,   0   ],   # top‑left
         [w-1, 0   ],   # top‑right
-        [w-1, h-1 ],   # bottom‑right
-        [0,   h-1 ]    # bottom‑left
+        [0,   0   ],   # top‑left
+        [0,   h-1 ],   # bottom‑left
+        [w-1, h-1 ]    # bottom‑right
     ], dtype=np.float32)
 
     # make sure your quad_points are also in the same (clockwise) order:
     dst_pts = np.array(quad_points, dtype=np.float32)
+    print(f"sourcepts{src_pts}")
+    print(f"distpts{dst_pts}")
 
     # compute the homography
     H = cv.getPerspectiveTransform(src_pts, dst_pts)
     return H
-
 
 def apply_homography(H, workspace, square_img):
     """
@@ -280,30 +323,30 @@ def detect_edges_and_lines(bgr: np.ndarray):
     gray  = cv.cvtColor(bgr, cv.COLOR_BGR2GRAY)
     gray = cv.GaussianBlur(gray, (15,15),0)
 
-    edges = cv.Canny(gray, CANNY_LOW, CANNY_HIGH)
+    edges = cv.Canny(gray, CANNY_LOW, CANNY_HIGH, L2gradient=True)
 
     segs = cv.HoughLinesP(edges, 1, np.pi/180,
                           threshold     = HOUGH_THRESH,
                           minLineLength = HOUGH_MIN_LEN,
                           maxLineGap    = HOUGH_GAP)
-    
+
     # print("segs")
     # print(segs)
     # print("segs-over")
-#----------------------------------------------------
+    #----------------------------------------------------
     x_low = 100
     x_high = 500
     y_low = 100
     y_high = 400
 
     segs_copy = []
-    
+
     for seg in segs[:,0]:
         if not (seg[0] < x_low or seg[0] > x_high or seg[1] < y_low or seg[1] > y_high or seg[2] < x_low or seg[2] > x_high or seg[3] < y_low or seg[3] > y_high):
             segs_copy += [[seg]]
     segs = np.array(segs_copy)
-    
-#------------------------------------------------------
+
+    #------------------------------------------------------
     # Draw segments on black canvas (white lines)
     canvas = np.zeros_like(bgr)
     if segs is not None:
@@ -319,6 +362,7 @@ def warp_to_projector(img: np.ndarray, H_cp: np.ndarray) -> np.ndarray:
                               borderMode=cv.BORDER_CONSTANT,
                               borderValue=(0, 0, 0))
 
+
 def main() -> None:
     # 1. load homography
     try:
@@ -329,21 +373,21 @@ def main() -> None:
         sys.exit("H_cp.npy missing or not a 3×3 matrix.")
 
     # 2. create windows
-    cv.namedWindow("Camera", cv.WINDOW_NORMAL)
-    cv.resizeWindow("Camera", 640, 360)
+    # cv.namedWindow("Camera", cv.WINDOW_NORMAL)
+    # cv.resizeWindow("Camera", 640, 360)
 
-    cv.namedWindow("Edges",  cv.WINDOW_NORMAL)
+    cv.namedWindow("Edges", cv.WINDOW_NORMAL)
     cv.resizeWindow("Edges", 640, 360)
 
-    cv.namedWindow("Lines",  cv.WINDOW_NORMAL)
-    cv.resizeWindow("Lines", 640, 360)
+    # cv.namedWindow("Lines",  cv.WINDOW_NORMAL)
+    # cv.resizeWindow("Lines", 640, 360)
 
-    cv.namedWindow("Projector", cv.WINDOW_NORMAL)
-    cv.moveWindow("Projector", PROJ_X_OFFSET, PROJ_Y_OFFSET)
-    cv.resizeWindow("Projector", *PROJ_RES)
-    cv.setWindowProperty("Projector",
-                         cv.WND_PROP_FULLSCREEN,
-                         cv.WINDOW_FULLSCREEN)
+    # cv.namedWindow("Projector", cv.WINDOW_NORMAL)
+    # cv.moveWindow("Projector", PROJ_X_OFFSET, PROJ_Y_OFFSET)
+    # cv.resizeWindow("Projector", *PROJ_RES)
+    # cv.setWindowProperty("Projector",
+    #                      cv.WND_PROP_FULLSCREEN,
+    #                      cv.WINDOW_FULLSCREEN)
 
     # 3. main loop
     while True:
@@ -353,37 +397,60 @@ def main() -> None:
 
         lkeep = filter_parallel_close(segs)
 
-        centroids = cluster_endpoints(lkeep)
+        lines_1 = cluster_endpoints(lkeep)
 
-        canvas = np.zeros_like(frame)
-        for pt in centroids:
-            cv.circle(canvas, (int(pt[0]), int(pt[1])), 1, color=(255, 255, 255), thickness=2)
+        lines_final = split_lines_at_nearby_points(lines_1)
 
-        quads, lenq = create_quadrilaterals(centroids)
+        quads = create_quads(lines_final)
 
-        # pts = clean_points(extract_points_from_lines(segs))  # Clean extracted points
-        print(quads)
-        print(lenq)
-            
-        canvas1 = np.zeros_like(frame)
-        if isinstance(quads, tuple):
-            quads = quads[0]
+        image_list = []
+        for i, q in enumerate(quads):
+            print(i)
+            if i > 2:
+                break
+            image = cv.imread(f"square{i+1}.jpg")
+            image_list.append(image)
 
-        for quad in quads:
-            pts = quad.reshape(-1, 1, 2).astype(np.int32)
-            cv.polylines(canvas1, [pts], isClosed=True, color=(255, 255, 255), thickness=2)
+        H_list = []
+        for i,image in enumerate(image_list):
+            # print(image_list[i])
+            H = compute_homography_from_image(image_list[i], quads[i]).astype(np.float32)
+            H_list.append(H)
+            print(f'H_list{i}: {H}')
 
+        warped_list = []
+        for i, H in enumerate(H_list):
+            warped = apply_homography(H, frame.shape[1::-1], image_list[i])
+            warped_list.append(warped)
 
-        proj = warp_to_projector(canvas1, H_cp)
+        # montage = combine_images(warped_list)
+        # if montage is None:
+        #     continue
+        
+        # print(f"quads {quads}")
+        # canvas1 = np.zeros_like(frame)
+
+        # for i, q in enumerate(quads):
+        #     color = (0,255,255)
+        #     if i == 0:
+        #         color = (255,255,0)
+        #     elif i == 1:
+        #         color = (255,0,255)
+        #     for l in q:
+        #         cv.line(canvas1, (int(l[0]), int(l[1])), (int(l[2]), int(l[3])),
+        #                 color=color, thickness=1)
+
+        proj = warp_to_projector(warped_list[0], H_cp)
 
         # previews
-        cv.imshow("Camera", frame)
+        # cv.imshow("Camera", frame)
         # cv.imshow("Edges",  edges)
-        cv.imshow("Lines",  canvas)
-        cv.imshow("Points",  canvas1)
+        # cv.imshow("Lines",  canvas)
+        # cv.imshow("Points",  canvas1)
         # cv.imshow("Lines",  line_img)
         # projector output
-        cv.imshow("Projector", proj)
+        cv.imshow("Edges", proj)
+        # cv.imshow("Projector", proj)
 
         if cv.waitKey(1) & 0xFF in (27, ord('q')):
             break
